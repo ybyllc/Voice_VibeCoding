@@ -8,6 +8,7 @@
 //! Windows 原生音量失效且 Tap 未就绪时三键全死）。
 
 use crate::bridges::xiaomi::connect::XiaomiRuntime;
+use crate::bridges::xiaomi::connection_session::ConnectionSession;
 use crate::bridges::xiaomi::input_session::run_input_session;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -344,7 +345,7 @@ pub fn button_label(id: &str) -> &'static str {
 /// 连接成功后启动按键通道（对齐 Python atvv_live_bridge 启动顺序）
 pub fn start_key_logger(
     app: AppHandle,
-    runtime: Arc<XiaomiRuntime>,
+    session: &mut ConnectionSession,
     address_u64: u64,
     atvv_interface_id: String,
 ) {
@@ -393,45 +394,44 @@ pub fn start_key_logger(
             emit_message(&app, "HID Tap 已按配置禁用");
         }
 
-        crate::bridges::xiaomi::raw_mapping::maybe_start_raw_mapping(
+        if let Some(worker) = crate::bridges::xiaomi::raw_mapping::maybe_start_raw_mapping(
             app.clone(),
-            Arc::clone(&runtime),
+            session.runtime(),
             Arc::clone(&gate),
             tap_started,
-        );
-
-        {
-            let app2 = app.clone();
-            let runtime2 = Arc::clone(&runtime);
-            let gate2 = Arc::clone(&gate);
-            let iface = atvv_interface_id.clone();
-            std::thread::Builder::new()
-                .name("xiaomi-gatt-input".into())
-                .spawn(move || {
-                    let result =
-                        run_input_session(app2.clone(), address_u64, iface, runtime2.clone(), gate2);
-                    runtime2.running.store(false, std::sync::atomic::Ordering::SeqCst);
-                    match result {
-                        Ok(()) => {}
-                        Err(e) => {
-                            log::warn!("ATVV input session unavailable: {e}");
-                            emit_message(&app2, &format!("ATVV 语音通道不可用: {e}"));
-                        }
-                    }
-                })
-                .ok();
+        ) {
+            session.track(worker);
         }
 
         {
             let app2 = app.clone();
-            let runtime2 = Arc::clone(&runtime);
             let gate2 = Arc::clone(&gate);
-            std::thread::Builder::new()
-                .name("xiaomi-vk-poll".into())
-                .spawn(move || {
-                    windows_vk_poll_logger(app2, runtime2, gate2);
-                })
-                .ok();
+            let iface = atvv_interface_id.clone();
+            if let Err(e) = session.spawn("xiaomi-gatt-input", move |runtime2| {
+                let result =
+                    run_input_session(app2.clone(), address_u64, iface, runtime2.clone(), gate2);
+                runtime2.running.store(false, Ordering::SeqCst);
+                match result {
+                    Ok(()) => {}
+                    Err(e) => {
+                        log::warn!("ATVV input session unavailable: {e}");
+                        emit_message(&app2, &format!("ATVV 语音通道不可用: {e}"));
+                    }
+                }
+            }) {
+                session.runtime().running.store(false, Ordering::SeqCst);
+                log::warn!("Xiaomi input worker start failed: {e}");
+            }
+        }
+
+        {
+            let app2 = app.clone();
+            let gate2 = Arc::clone(&gate);
+            if let Err(e) = session.spawn("xiaomi-vk-poll", move |runtime2| {
+                windows_vk_poll_logger(app2, runtime2, gate2);
+            }) {
+                log::warn!("Xiaomi key poll worker start failed: {e}");
+            }
         }
 
         emit_message(
@@ -441,7 +441,7 @@ pub fn start_key_logger(
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, runtime, address_u64, atvv_interface_id);
+        let _ = (app, session, address_u64, atvv_interface_id);
     }
 }
 

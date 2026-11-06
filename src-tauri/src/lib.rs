@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn second_instance_policy_follows_setting() {
-        use config::manager::GlobalSettings;
+        use crate::config::manager::GlobalSettings;
         assert!(!GlobalSettings::default().start_minimized_to_tray);
         assert!(GlobalSettings::parse_start_minimized_to_tray_json(
             r#"{"autostart":false,"language":"zh-CN","minimize_to_tray":true,"start_minimized_to_tray":true}"#

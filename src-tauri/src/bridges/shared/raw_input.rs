@@ -153,7 +153,8 @@ mod win32 {
         ) -> i32;
         pub fn TranslateMessage(lpMsg: *const MSG) -> i32;
         pub fn DispatchMessageW(lpMsg: *const MSG) -> LRESULT;
-        pub fn PostMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> i32;
+        pub fn GetCurrentThreadId() -> DWORD;
+        pub fn PostThreadMessageW(idThread: DWORD, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> i32;
         pub fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: LONG_PTR) -> LONG_PTR;
         pub fn GetWindowLongPtrW(hWnd: HWND, nIndex: i32) -> LONG_PTR;
     }
@@ -179,14 +180,45 @@ pub struct RawInputEvent {
 
 type EventCallback = Arc<Mutex<dyn FnMut(RawInputEvent) + Send + 'static>>;
 
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn raw_input_can_stop_without_events_and_restart() {
+        let mut bridge = RawInputBridge::new();
+        for _ in 0..10 {
+            bridge.start(|_| {}).unwrap();
+            let started = Instant::now();
+            while bridge.thread_id.load(Ordering::SeqCst) == 0 {
+                assert!(started.elapsed() < Duration::from_secs(5));
+                thread::sleep(Duration::from_millis(1));
+            }
+            bridge.stop();
+            assert!(!bridge.is_running());
+            assert!(bridge.thread_handle.is_none());
+            assert_eq!(bridge.thread_id.load(Ordering::SeqCst), 0);
+        }
+        bridge.start(|_| {}).unwrap();
+        bridge.stop();
+        assert!(bridge.thread_handle.is_none());
+    }
+}
+
 pub struct RawInputBridge {
     running: Arc<AtomicBool>,
+    thread_id: Arc<std::sync::atomic::AtomicU32>,
     thread_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl RawInputBridge {
     pub fn new() -> Self {
-        Self { running: Arc::new(AtomicBool::new(false)), thread_handle: None }
+        Self {
+            running: Arc::new(AtomicBool::new(false)),
+            thread_id: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            thread_handle: None,
+        }
     }
 
     pub fn start<F>(&mut self, callback: F) -> Result<(), String>
@@ -197,13 +229,16 @@ impl RawInputBridge {
         }
         self.running.store(true, Ordering::SeqCst);
         let running = Arc::clone(&self.running);
+        let thread_id = Arc::clone(&self.thread_id);
         let cb: EventCallback = Arc::new(Mutex::new(callback));
 
         self.thread_handle = Some(thread::spawn(move || {
             #[cfg(target_os = "windows")]
-            raw_input_thread_impl(running, cb);
+            raw_input_thread_impl(Arc::clone(&running), Arc::clone(&thread_id), cb);
             #[cfg(not(target_os = "windows"))]
-            { log::warn!("RawInput only on Windows"); let _ = (running, cb); }
+            { log::warn!("RawInput only on Windows"); let _ = cb; }
+            running.store(false, Ordering::SeqCst);
+            thread_id.store(0, Ordering::SeqCst);
         }));
 
         log::info!("RawInputBridge started");
@@ -211,10 +246,14 @@ impl RawInputBridge {
     }
 
     pub fn stop(&mut self) {
-        if !self.running.load(Ordering::SeqCst) { return; }
         self.running.store(false, Ordering::SeqCst);
         #[cfg(target_os = "windows")]
-        unsafe { win32::PostMessageW(std::ptr::null_mut(), win32::WM_QUIT, 0, 0); }
+        {
+            let thread_id = self.thread_id.load(Ordering::SeqCst);
+            if thread_id != 0 {
+                unsafe { win32::PostThreadMessageW(thread_id, win32::WM_QUIT, 0, 0); }
+            }
+        }
         if let Some(h) = self.thread_handle.take() { let _ = h.join(); }
         log::info!("RawInputBridge stopped");
     }
@@ -227,7 +266,11 @@ impl RawInputBridge {
 // ============================================================
 
 #[cfg(target_os = "windows")]
-fn raw_input_thread_impl(running: Arc<AtomicBool>, callback: EventCallback) {
+fn raw_input_thread_impl(
+    running: Arc<AtomicBool>,
+    thread_id: Arc<std::sync::atomic::AtomicU32>,
+    callback: EventCallback,
+) {
     use win32::*;
     use std::mem;
     use std::ptr;
@@ -246,7 +289,8 @@ fn raw_input_thread_impl(running: Arc<AtomicBool>, callback: EventCallback) {
     wc.hInstance = hinstance;
     wc.lpszClassName = class_name.as_ptr();
 
-    if unsafe { RegisterClassExW(&wc) } == 0 {
+    static CLASS_REGISTERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*CLASS_REGISTERED.get_or_init(|| unsafe { RegisterClassExW(&wc) != 0 }) {
         log::error!("RegisterClassExW failed");
         return;
     }
@@ -263,6 +307,7 @@ fn raw_input_thread_impl(running: Arc<AtomicBool>, callback: EventCallback) {
         log::error!("CreateWindowExW failed");
         return;
     }
+    thread_id.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
 
     // Store callback Arc pointer in GWLP_USERDATA
     let cb_raw = Arc::into_raw(Arc::new(callback));
@@ -293,7 +338,10 @@ fn raw_input_thread_impl(running: Arc<AtomicBool>, callback: EventCallback) {
     } == 0
     {
         log::error!("RegisterRawInputDevices failed");
-        unsafe { DestroyWindow(hwnd); }
+        unsafe {
+            let _ = Arc::from_raw(cb_raw);
+            DestroyWindow(hwnd);
+        }
         return;
     }
 

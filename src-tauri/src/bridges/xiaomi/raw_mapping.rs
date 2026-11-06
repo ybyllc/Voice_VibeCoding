@@ -35,7 +35,7 @@ pub fn maybe_start_raw_mapping(
     runtime: Arc<XiaomiRuntime>,
     gate: Arc<KeyEmitGate>,
     hid_tap_started: bool,
-) {
+) -> Option<std::thread::JoinHandle<()>> {
     let config = app
         .try_state::<ConfigManager>()
         .and_then(|m| m.get_device_config("xiaomi").ok());
@@ -52,7 +52,7 @@ pub fn maybe_start_raw_mapping(
         log::info!(
             "XIAOMI RAW MAPPING skipped tap_started={hid_tap_started} fallback={fallback_required}"
         );
-        return;
+        return None;
     }
 
     emit_message(&app, "Raw Input 旁路已启动（HID Tap 未附着时的按键兜底）");
@@ -61,7 +61,8 @@ pub fn maybe_start_raw_mapping(
         .spawn(move || {
             run_raw_mapping(app, runtime, gate);
         })
-        .ok();
+        .map_err(|e| log::warn!("Xiaomi raw mapping worker start failed: {e}"))
+        .ok()
 }
 
 fn run_raw_mapping(app: AppHandle, runtime: Arc<XiaomiRuntime>, gate: Arc<KeyEmitGate>) {

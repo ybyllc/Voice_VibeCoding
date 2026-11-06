@@ -22,6 +22,7 @@ pub mod raw_mapping;
 pub mod autostart;
 pub mod config;
 pub mod connect;
+pub mod connection_session;
 pub mod key_log;
 pub mod input_session;
 pub mod voice_dispatch;

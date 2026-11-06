@@ -238,17 +238,18 @@ pub fn monitor_connection(
     stop: Arc<XiaomiRuntime>,
     app: Option<tauri::AppHandle>,
 ) -> Result<(), String> {
+    let mut session = super::connection_session::ConnectionSession::new();
     if let Some(app) = app.clone() {
         crate::bridges::xiaomi::key_log::start_key_logger(
             app,
-            Arc::clone(&stop),
+            &mut session,
             conn.address_u64,
             conn.atvv_interface_id.clone(),
         );
     }
     #[cfg(target_os = "windows")]
     {
-        return windows_monitor_connection(conn.address_u64, stop);
+        return windows_monitor_connection(stop, session.runtime());
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -545,22 +546,13 @@ fn windows_open_via_address(candidate: &XiaomiCandidate) -> Result<XiaomiConnect
 
 #[cfg(target_os = "windows")]
 fn windows_monitor_connection(
-    _address_u64: u64,
     runtime: Arc<XiaomiRuntime>,
+    session: Arc<XiaomiRuntime>,
 ) -> Result<(), String> {
     // 断连由 input_session 在同一 BLE 句柄上监听；此处不再打开第三个句柄。
-    let wait_start = std::time::Instant::now();
-    while !runtime.running.load(Ordering::SeqCst)
-        && !runtime.should_stop()
-        && wait_start.elapsed() < Duration::from_secs(30)
-    {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    while !runtime.should_stop() && runtime.running.load(Ordering::SeqCst) {
+    while !runtime.should_stop() && session.running.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(200));
     }
-    runtime.running.store(false, Ordering::SeqCst);
     if runtime.should_stop() {
         Ok(())
     } else {
